@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <dirent.h>
@@ -19,12 +20,77 @@
 // Global structures
 UserDB* user_db = NULL;
 Queue* task_queue = NULL;
+Queue* client_queue = NULL;
+int server_socket = -1;
+volatile sig_atomic_t shutdown_flag = 0;
+
+// Thread arrays
+pthread_t worker_threads[WORKER_POOL_SIZE];
+pthread_t client_threads[CLIENT_POOL_SIZE];
 
 // Forward declarations
 void worker_thread_func(void* arg);
 void* worker_thread_loop(void* arg);
 void client_thread_func(void* arg);
 void* client_thread_loop(void* arg);
+void signal_handler(int signum);
+void cleanup_resources(void);
+
+// Signal handler for graceful shutdown
+void signal_handler(int signum) {
+    if (signum == SIGINT || signum == SIGTERM) {
+        printf("\n[Main] Shutdown signal received, cleaning up...\n");
+        shutdown_flag = 1;
+        
+        // Close server socket to interrupt accept()
+        if (server_socket >= 0) {
+            close(server_socket);
+            server_socket = -1;
+        }
+    }
+}
+
+// Cleanup function
+void cleanup_resources(void) {
+    printf("[Main] Starting cleanup...\n");
+    
+    // Shutdown client queue
+    if (client_queue) {
+        queue_shutdown(client_queue);
+        for (int i = 0; i < CLIENT_POOL_SIZE; i++) {
+            pthread_join(client_threads[i], NULL);
+        }
+        queue_destroy(client_queue);
+        client_queue = NULL;
+        printf("[Main] Client threads cleaned up\n");
+    }
+    
+    // Shutdown task queue
+    if (task_queue) {
+        queue_shutdown(task_queue);
+        for (int i = 0; i < WORKER_POOL_SIZE; i++) {
+            pthread_join(worker_threads[i], NULL);
+        }
+        queue_destroy(task_queue);
+        task_queue = NULL;
+        printf("[Main] Worker threads cleaned up\n");
+    }
+    
+    // Cleanup user database
+    if (user_db) {
+        user_db_destroy(user_db);
+        user_db = NULL;
+        printf("[Main] User database cleaned up\n");
+    }
+    
+    // Close server socket if still open
+    if (server_socket >= 0) {
+        close(server_socket);
+        server_socket = -1;
+    }
+    
+    printf("[Main] Cleanup complete\n");
+}
 
 // Helper function to read a line from socket
 ssize_t read_line(int socket, char* buffer, size_t max_len) {
@@ -452,6 +518,10 @@ int main() {
     printf("=== Dropbox Clone Server (Phase 2) ===\n");
     printf("Features: Condition Variables, No Busy Waiting\n\n");
     
+    // Set up signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
     // Initialize user database
     user_db = user_db_create(USER_TABLE_SIZE);
     if (!user_db) {
@@ -470,52 +540,39 @@ int main() {
     printf("[Main] Task queue initialized\n");
     
     // Create worker threads
-    pthread_t worker_threads[WORKER_POOL_SIZE];
     for (int i = 0; i < WORKER_POOL_SIZE; i++) {
         if (pthread_create(&worker_threads[i], NULL, worker_thread_loop, task_queue) != 0) {
             fprintf(stderr, "Failed to create worker thread %d\n", i);
-            queue_destroy(task_queue);
-            user_db_destroy(user_db);
+            cleanup_resources();
             return 1;
         }
     }
     printf("[Main] Worker threadpool created (%d threads)\n", WORKER_POOL_SIZE);
     
     // Create client queue
-    Queue* client_queue = queue_create();
+    client_queue = queue_create();
     if (!client_queue) {
         fprintf(stderr, "Failed to create client queue\n");
-        queue_shutdown(task_queue);
-        for (int i = 0; i < WORKER_POOL_SIZE; i++) {
-            pthread_join(worker_threads[i], NULL);
-        }
-        queue_destroy(task_queue);
-        user_db_destroy(user_db);
+        cleanup_resources();
         return 1;
     }
     printf("[Main] Client queue initialized\n");
     
     // Create client threads
-    pthread_t client_threads[CLIENT_POOL_SIZE];
     for (int i = 0; i < CLIENT_POOL_SIZE; i++) {
         if (pthread_create(&client_threads[i], NULL, client_thread_loop, client_queue) != 0) {
             fprintf(stderr, "Failed to create client thread %d\n", i);
-            queue_destroy(client_queue);
-            queue_shutdown(task_queue);
-            for (int j = 0; j < WORKER_POOL_SIZE; j++) {
-                pthread_join(worker_threads[j], NULL);
-            }
-            queue_destroy(task_queue);
-            user_db_destroy(user_db);
+            cleanup_resources();
             return 1;
         }
     }
     printf("[Main] Client threadpool created (%d threads)\n\n", CLIENT_POOL_SIZE);
     
     // Create server socket
-    int server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
     if (server_socket < 0) {
         perror("Socket creation failed");
+        cleanup_resources();
         return 1;
     }
     
@@ -523,7 +580,7 @@ int main() {
     int opt = 1;
     if (setsockopt(server_socket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         perror("Setsockopt failed");
-        close(server_socket);
+        cleanup_resources();
         return 1;
     }
     
@@ -536,14 +593,14 @@ int main() {
     
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
         perror("Bind failed");
-        close(server_socket);
+        cleanup_resources();
         return 1;
     }
     
     // Listen
     if (listen(server_socket, 10) < 0) {
         perror("Listen failed");
-        close(server_socket);
+        cleanup_resources();
         return 1;
     }
     
@@ -551,12 +608,16 @@ int main() {
     printf("[Main] Press Ctrl+C to shutdown\n\n");
     
     // Accept loop
-    while (1) {
+    while (!shutdown_flag) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
         
         int client_socket = accept(server_socket, (struct sockaddr*)&client_addr, &client_len);
         if (client_socket < 0) {
+            if (shutdown_flag) {
+                // Expected error during shutdown
+                break;
+            }
             perror("Accept failed");
             continue;
         }
@@ -564,24 +625,17 @@ int main() {
         printf("[Main] New connection accepted (socket %d)\n", client_socket);
         
         int* socket_ptr = malloc(sizeof(int));
+        if (!socket_ptr) {
+            close(client_socket);
+            continue;
+        }
         *socket_ptr = client_socket;
         queue_push(client_queue, socket_ptr);
     }
     
-    // Cleanup (unreachable without signal handling)
-    close(server_socket);
-    queue_shutdown(client_queue);
-    for (int i = 0; i < CLIENT_POOL_SIZE; i++) {
-        pthread_join(client_threads[i], NULL);
-    }
-    queue_destroy(client_queue);
+    // Cleanup
+    cleanup_resources();
     
-    queue_shutdown(task_queue);
-    for (int i = 0; i < WORKER_POOL_SIZE; i++) {
-        pthread_join(worker_threads[i], NULL);
-    }
-    queue_destroy(task_queue);
-    user_db_destroy(user_db);
-    
+    printf("[Main] Server shutdown complete\n");
     return 0;
 }
